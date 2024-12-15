@@ -12,6 +12,7 @@ import io
 from datetime import datetime
 import traceback
 import numpy as np
+import sys
 
 try:
     from openai import OpenAI
@@ -61,8 +62,9 @@ def safe_execute_code(code_string, local_vars=None):
             local_vars = {}
             
         # Extract code from markdown-style code blocks if present
-        if "```python" in code_string:
+        if "```" in code_string:
             code_parts = code_string.split("```")
+            code_string = ""
             for part in code_parts:
                 if part.strip().startswith("python"):
                     code_string = part.replace("python", "").strip()
@@ -88,59 +90,93 @@ def safe_execute_code(code_string, local_vars=None):
             **local_vars
         }
 
-        # Execute the code
-        exec(code_string, {}, exec_locals)
+        # Redirect stdout to capture print statements
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
 
-        # Handle matplotlib plots
-        if 'plt' in exec_locals:
-            plt_instance = exec_locals['plt']
-            if plt_instance.get_fignums():
-                plt.close('all')
-                return None, None
+        try:
+            # Execute the code
+            exec(code_string, {}, exec_locals)
+            
+            # Handle matplotlib plots
+            if 'plt' in exec_locals:
+                plt_instance = exec_locals['plt']
+                if plt_instance.get_fignums():
+                    plt.close('all')
+                    
+            return None, None
 
-        return None, None
+        finally:
+            # Restore stdout
+            sys.stdout = old_stdout
+            plt.close('all')  # Ensure all plots are closed
 
     except Exception as e:
         plt.close('all')  # Clean up any open plots
-        logging.error(f"Error executing code: {str(e)}\nCode:\n{code_string}")
+        # Only log actual errors, not code execution details
+        if not str(e).startswith("plt."):  # Don't log matplotlib commands
+            logging.error(f"Error executing code: {str(e)}")
         return None, str(e)
 
 
 def analyze_data(file_path):
     """Analyzes data using pandas, returning summaries and the DataFrame."""
     try:
-        df = pd.read_csv(file_path)
+        # Try different encodings
+        encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+        df = None
+        
+        for encoding in encodings:
+            try:
+                df = pd.read_csv(file_path, encoding=encoding)
+                logging.info(f"Successfully loaded data with {encoding} encoding")
+                break
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logging.error(f"Error loading data with {encoding} encoding: {str(e)}")
+                continue
+        
+        if df is None:
+            raise ValueError("Could not read file with any of the attempted encodings")
+
+        # Clean column names
+        df.columns = df.columns.str.strip()
+        
+        # Handle any special characters in data
+        for col in df.select_dtypes(include=['object']).columns:
+            df[col] = df[col].astype(str).str.encode('ascii', 'ignore').str.decode('ascii')
+        
         logging.info(f"Loaded data from {file_path} successfully.")
+        
+        # Data Summary
+        data_summary = {
+            "filename": file_path,
+            "columns": list(df.columns),
+            "data_types": df.dtypes.apply(str).to_dict(),
+            "sample_values": df.head(5).to_dict(orient='list'),
+            "missing_values": df.isnull().sum().to_dict(),
+            "describe": df.describe().to_dict()
+        }
+
+        return df, data_summary, list(df.columns)
+        
     except Exception as e:
-        logging.error(f"Error loading data: {e}")
+        logging.error(f"Error loading data: {str(e)}")
         return None, None, None
-
-    # Data Summary
-    data_summary = {
-        "filename": file_path,
-        "columns": list(df.columns),
-        "data_types": df.dtypes.apply(str).to_dict(),
-        "sample_values": df.head(5).to_dict(orient='list'),
-        "missing_values": df.isnull().sum().to_dict(),
-        "describe": df.describe().to_dict()
-    }
-
-    return df, data_summary, list(df.columns)
 
 
 def generate_llm_prompt(data_summary, step_description, user_message):
     """Generates prompts for LLM with a system instruction."""
     system_instruction = (
         "You are an expert data analyst and storyteller. Your goal is to analyze the provided data and create "
-        "a comprehensive narrative. You will analyze various aspects of the data and "
-        "suggest next steps. If I ask for code, return a complete, working Python code block that:"
-        "\n1. Uses only pandas, matplotlib, or seaborn"
-        "\n2. Properly closes all plots using plt.close()"
-        "\n3. Saves charts as PNG files using plt.savefig()"
-        "\n4. Has proper error handling"
-        "\n5. Uses clear variable names"
-        "\nBe brief in your replies. Do not add anything extra. "
-        "If I request a summary or analysis or narrative or a story, then provide it."
+        "a comprehensive narrative. When generating code:"
+        "\n1. Do not include explanatory text or comments"
+        "\n2. Only return the pure Python code block"
+        "\n3. Use pandas, matplotlib, or seaborn only"
+        "\n4. Always close plots after saving"
+        "\n5. Use clear variable names"
+        "\nBe concise and direct in your responses."
     )
     
     prompt = [
@@ -234,6 +270,9 @@ def analyze_and_visualize(file_path):
     markdown_content = ""
     image_paths = []
 
+    # Suppress matplotlib debug messages
+    plt.set_loglevel('warning')
+    
     # --- Initial Analysis ---
     user_message = "Summarize the provided dataset, identify potential areas of interest, and suggest initial analysis to explore the data."
     prompt = generate_llm_prompt(data_summary, "Initial Analysis of the data.", user_message)
